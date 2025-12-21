@@ -1,0 +1,32 @@
+# Exe goes to Releases, not Repo
+*.exe
+
+# Ignore everything else compiled
+*.spec
+*.onefile-build
+*.zip
+*.tar.gz
+nuitka_dist*/
+
+# Ignore Source Code (Binary Only Repo)
+*.py
+__pycache__/
+*.py[cod]
+
+# Config & Secrets (Never commit these!)
+.env
+config.json
+session.json
+
+# Logs
+stremio_rpc.log
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Local Assets / Temp
+Output_Lite/
+python/
+tmp/
