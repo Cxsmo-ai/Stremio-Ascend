@@ -1,0 +1,83 @@
+.vc-switch-container {
+    display: flex;
+    align-items: center;
+    position: relative;
+}
+
+.vc-switch-indicator {
+    background: var(--switch-background-default);
+    border: 1px solid var(--switch-border-default);
+    border-radius: var(--radius-lg);
+    box-sizing: border-box;
+    cursor: pointer;
+    height: 24px;
+    position: relative;
+    width: 48px;
+    transition: background-color 200ms ease, border-color 200ms ease;
+}
+
+.vc-switch-checked .vc-switch-indicator {
+    background: var(--switch-background-selected-default);
+    border-color: var(--switch-border-selected-default);
+}
+
+.vc-switch-disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+}
+
+.vc-switch-disabled .vc-switch-indicator {
+    cursor: not-allowed;
+}
+
+.vc-switch-focusVisible .vc-switch-indicator {
+    box-shadow: 0 0 0 2px var(--border-focus, #00a8fc);
+}
+
+.vc-switch-container:hover .vc-switch-indicator {
+    background: var(--switch-background-hover);
+    border-color: var(--switch-border-hover);
+}
+
+.vc-switch-checked:hover .vc-switch-indicator {
+    background: var(--switch-background-selected-hover);
+    border-color: var(--switch-border-selected-hover);
+}
+
+.vc-switch-thumb {
+    align-items: center;
+    display: flex;
+    height: 24px;
+    justify-content: center;
+    left: 1px;
+    margin-left: -1px;
+    margin-top: -1px;
+    position: absolute;
+    width: 24px;
+    transition: left 150ms ease-in-out;
+}
+
+.vc-switch-checked .vc-switch-thumb {
+    left: 24px;
+}
+
+.vc-switch-checked .vc-switch-thumb rect {
+    fill: var(--switch-thumb-background-selected-default);
+}
+
+.vc-switch-input {
+    border-radius: 14px;
+    cursor: pointer;
+    height: 100%;
+    left: 0;
+    margin: 0;
+    opacity: 0;
+    position: absolute;
+    top: 0;
+    width: 100%;
+
+    &:disabled {
+        pointer-events: none;
+        cursor: not-allowed
+    }
+}

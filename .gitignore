@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+
+# Build/Dist
+build/
+dist/
+*.exe
+*.onefile-build/
+
+# Configuration (DO NOT PUSH REAL KEYS)
+config.json
+.env
+security.key
+*.log
+
+# Vencord
+vencord/node_modules/
+vencord/BetterVencordPatchset/node_modules/
+vencord/.git/
+
+# OS
+.DS_Store
+Thumbs.db

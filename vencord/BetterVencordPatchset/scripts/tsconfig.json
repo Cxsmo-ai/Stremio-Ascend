@@ -1,0 +1,9 @@
+{
+  "include": ["build.ts"],
+  "compilerOptions": {
+    "module": "es2022",
+    "moduleResolution": "node",
+    "allowSyntheticDefaultImports": true,
+    "lib": ["ES2020", "DOM"]
+  }
+}

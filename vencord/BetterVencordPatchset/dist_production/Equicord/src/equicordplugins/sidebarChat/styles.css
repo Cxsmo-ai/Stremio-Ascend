@@ -1,0 +1,7 @@
+[class*="content"] > [class*="page"] > * {
+    min-width: 0;
+}
+
+.vc-sidebar-chat-popout {
+    align-items: stretch;
+}

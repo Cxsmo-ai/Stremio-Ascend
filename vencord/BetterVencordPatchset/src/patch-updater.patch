@@ -1,0 +1,15 @@
+--- base/Vencord/src/main/updater/http.ts
++++ dist/Vencord/src/main/updater/http.ts
+@@ -59,1 +59,2 @@
+-async function fetchUpdates() {
++async function fetchUpdates() {
++    return false;
+@@ -46,2 +46,0 @@
+-    const isOutdated = await fetchUpdates();
+-    if (!isOutdated) return [];
+@@ -26,2 +26,3 @@
+-import gitHash from "~git-hash";
++import gitHash_raw from "~git-hash";
++const gitHash = gitHash_raw.split("built by ")[1].split(")")[0];
+-import gitRemote from "~git-remote";
++import { BV_REMOTE as gitRemote } from "~git-remote";

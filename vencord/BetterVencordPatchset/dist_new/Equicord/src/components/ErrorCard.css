@@ -1,0 +1,15 @@
+.vc-error-card {
+    padding: 1em;
+    background-color: var(--background-feedback-critical, rgb(237 66 69 / 10%));
+    border: 1px solid var(--text-status-dnd, #ed4245);
+    border-radius: var(--radius-sm, 8px);
+    color: var(--text-default);
+}
+
+.vc-error-card a {
+    color: var(--text-link);
+}
+
+.vc-error-card a:hover {
+    text-decoration: underline;
+}

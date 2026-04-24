@@ -1,0 +1,874 @@
+/*
+ * Vencord, a modification for Discord's desktop app
+ * Copyright (c) 2022 Vendicated and contributors
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+*/
+
+"use strict";
+/* eslint-disable eqeqeq */
+// import { readFileSync } from "fs";
+// const process = require("~process");
+import { Settings } from "@api/Settings";
+import { copyToClipboard } from "@utils/clipboard";
+import definePlugin, { OptionType, PluginDef } from "@utils/types";
+import { React } from "@webpack/common";
+
+import { PluginMeta } from "~plugins";
+
+import { PLUGIN_NAME } from "./constants";
+import { cleanupGlobal, createGlobalBdApi, getGlobalApi } from "./fakeBdApi";
+import { addContextMenu, addDiscordModules, FakeEventEmitter, fetchWithCorsProxyFallback, Patcher } from "./fakeStuff";
+import { injectSettingsTabs, unInjectSettingsTab } from "./fileSystemViewer";
+import { addCustomPlugin, convertPlugin, removeAllCustomPlugins } from "./pluginConstructor";
+import { ReactUtils_filler } from "./stuffFromBD";
+import { compat_logger, FSUtils, getDeferred, reloadCompatLayer, simpleGET, ZIPUtils } from "./utils";
+// String.prototype.replaceAll = function (search, replacement) {
+//     var target = this;
+//     return target.split(search).join(replacement);
+// };
+import { Backend, configureSingle, InMemory, MountConfiguration, fs as ZenFS_fs } from "@zenfs/core";
+import { RealFSClient, RealFs } from "real-fs-client";
+import { IndexedDB as ZenFS_IndexedDB, WebStorage as ZenFS_WebStorage } from "@zenfs/dom";
+import * as ZenFS_path from "@zenfs/core/path";
+
+async function checkCorsProxyUrlCsp() {
+    if (IS_WEB) return true;
+
+    const current = Settings.plugins[PLUGIN_NAME].corsProxyUrl ?? thePlugin.options.corsProxyUrl.default;
+    if (await VencordNative.csp.isDomainAllowed(current, ["connect-src"])) {
+        compat_logger.debug("CSP for CORS Proxy is allowed");
+        return true;
+    }
+
+    const res = await VencordNative.csp.requestAddOverride(current, ["connect-src"], "BD Compat Layer: CORS Proxy");
+    if (res === "ok") {
+        compat_logger.debug("CSP for CORS Proxy is allowed from now");
+        return true;
+    }
+    return false;
+}
+
+const thePlugin = {
+    name: PLUGIN_NAME,
+    description: "Converts BD plugins to run in Vencord",
+    authors: [
+        {
+            id: 568109529884000260n,
+            name: "Davilarek",
+        },
+        {
+            id: 917630027477159986n,
+            name: "zrodevkaan",
+        },
+    ],
+    // patches: [
+    //     {
+    //         match: (/(\w+)\.\w+\s*=\s*function\(\w+\,\w+\){for\(var\s+\w\s+in\s\w+\)\w\.o\(\w,\w\)&&!\w\.o\(\w,\w\)&&Object.defineProperty\(\w,\w,{enumerable:!0,get:\w\[\w\]}\)}/.toString()),
+    //         replace: `$1.d = function (target, exports) { console.log("hello there"); for (const key in exports) { Object.defineProperty( target, key, {get: () => exports[key](),set: e => { exports[key] = () => e }, enumerable: !0, configurable: !1}); } }`
+    //     }
+    // ],
+    options: {
+        enableExperimentalRequestPolyfills: {
+            description: "Enables request polyfills that first try to request using normal fetch, then using a cors proxy when the normal one fails",
+            type: OptionType.BOOLEAN,
+            default: false,
+            restartNeeded: false,
+        },
+        corsProxyUrl: {
+            description: "CORS proxy used to bypass CORS",
+            type: OptionType.STRING,
+            default: "https://cors-get-proxy.sirjosh.workers.dev/?url=",
+            restartNeeded: true,
+        },
+        useIndexedDBInstead: {
+            description: "Uses indexedDB instead of localStorage. It may cause memory usage issues but prevents exceeding localStorage quota. Note, after switching, you have to import your stuff back manually",
+            type: OptionType.BOOLEAN,
+            default: false,
+            restartNeeded: true,
+        },
+        useRealFsInstead: {
+            description: "Uses true, real filesystem hosted locally mounted on RealFS server's mount point instead of localStorage. It may cause memory usage issues but prevents exceeding localStorage quota. Note, after switching, you have to import your stuff back manually",
+            type: OptionType.BOOLEAN,
+            default: false,
+            restartNeeded: true,
+        },
+        /*
+        ...(!IS_WEB && {
+            usePoorlyMadeRealFs: {
+                description: "Uses your very own filesystem to manage plugins, etc. Not recommended as there is no security for this option. Use at your own risk, basically. Not functional right now.",
+                type: OptionType.BOOLEAN,
+                default: false,
+                restartNeeded: true,
+            }
+        }),
+        */
+        safeMode: {
+            description: "Loads only filesystem",
+            type: OptionType.BOOLEAN,
+            default: false,
+            restartNeeded: true,
+        },
+        pluginUrl1: {
+            description: "Plugin url 1",
+            type: OptionType.STRING,
+            default: "",
+            restartNeeded: true,
+        },
+        pluginUrl2: {
+            description: "Plugin url 2",
+            type: OptionType.STRING,
+            default: "",
+            restartNeeded: true,
+        },
+        pluginUrl3: {
+            description: "Plugin url 3",
+            type: OptionType.STRING,
+            default: "",
+            restartNeeded: true,
+        },
+        pluginUrl4: {
+            description: "Plugin url 4",
+            type: OptionType.STRING,
+            default: "",
+            restartNeeded: true,
+        },
+        pluginsStatus: {
+            description: "",
+            default: {},
+            type: OptionType.COMPONENT,
+            component() {
+                return React.createElement("div");
+            }
+        }
+    },
+    originalBuffer: {},
+    globalWasNotExisting: false,
+    globalDefineWasNotExisting: false,
+    start() {
+        injectSettingsTabs();
+        const reimplementationsReady = getDeferred<void>();
+        // const proxyUrl = "https://api.allorigins.win/raw?url=";
+        // const proxyUrl = "https://cors-get-proxy.sirjosh.workers.dev/?url=";
+        const proxyUrl = Settings.plugins[this.name].corsProxyUrl ?? this.options.corsProxyUrl.default;
+        // eslint-disable-next-line no-prototype-builtins
+        if (!Settings.plugins[this.name].hasOwnProperty("pluginsStatus")) {
+            Settings.plugins[this.name].pluginsStatus = this.options.pluginsStatus.default;
+        }
+        const target = {
+            browserFSSetting: {},
+            client: null as RealFSClient | null,
+        }; // because "let" sucks
+        const status = {
+            setup: getDeferred<void>(),
+        };
+        if (Settings.plugins[this.name].useRealFsInstead === true) {
+            target.client = new RealFSClient("127.0.0.1:8000/api/v2/ws"); // TODO: add option to change this
+            target.browserFSSetting = {
+                backend: RealFs,
+                sync: InMemory,
+                client: target.client,
+            };
+            status.setup.resolve(); // TODO: maybe make this wait for client.ready?
+        } else if (Settings.plugins[this.name].useIndexedDBInstead === true) {
+            const storeName = "VirtualFS_v2";
+            target.browserFSSetting = {
+                backend: ZenFS_IndexedDB,
+                storeName: storeName,
+            };
+            /*      
+            const setup = async () => {
+                const dbs = await indexedDB.databases();
+                const oldDb = dbs.find(x => x.name === storeName);
+                if (oldDb && oldDb.version < 2) {
+                    const trx = indexedDB.open(storeName, oldDb.version + 1);
+                    trx.onsuccess = (ev) => {
+                        console.log("Open success", ev);
+                        trx.result.deleteObjectStore() // TODO: migrate? maybe
+                    };
+                    trx.onupgradeneeded = (ev) => {
+                        console.log("Upgrade success", ev);
+                    }
+                    trx.onerror = (ev) => {
+                        console.log("Open error", ev);
+                    }
+                }
+            };
+            setup().then(status.setup.resolve, status.setup.reject);
+            */
+            status.setup.resolve();
+        } else {
+            target.browserFSSetting = {
+                backend: ZenFS_WebStorage, storage: Vencord.Util.localStorage,
+            };
+            status.setup.resolve();
+        }
+        Promise.all([status.setup.promise, configureSingle(target.browserFSSetting as MountConfiguration<Backend>)]).then(
+            async () => {
+                if (target.client && target.client instanceof RealFSClient) await target.client.ready;
+                ReImplementationObject.fs = ZenFS_fs;
+                ReImplementationObject.path = ZenFS_path;
+                if (Settings.plugins[this.name].safeMode == undefined || Settings.plugins[this.name].safeMode == false)
+                    // @ts-ignore
+                    windowBdCompatLayer.fsReadyPromise.resolve();
+            }
+        );
+
+        // const Utils = {
+        //     stream2buffer(stream) {
+        //         return new Promise((resolve, reject) => {
+        //             const _buf = [];
+        //             stream.on("data", chunk => _buf.push(chunk));
+        //             stream.on("end", () => resolve(Buffer.concat(_buf)));
+        //             stream.on("error", err => reject(err));
+        //         });
+        //     },
+        // };
+        let _Router = null;
+        const windowBdCompatLayer = {
+            // Utils,
+            // exportZip,
+            // completeFileSystem,
+            // downloadZip,
+            // importZip,
+            // importFile,
+            FSUtils,
+            ZIPUtils,
+            reloadCompatLayer,
+            fsReadyPromise: getDeferred(),
+            mainObserver: {},
+            mainRouterListener: () =>
+                window.GeneratedPlugins.forEach(plugin =>
+                    BdApiReImplementation.Plugins.isEnabled(plugin.name) && typeof plugin.instance.onSwitch === "function" && plugin.instance.onSwitch()
+                ),
+            get Router() {
+                if (_Router == null)
+                    _Router = BdApiReImplementation.Webpack.getModule(x => x.listeners && x.flushRoute);
+                return _Router as null | { listeners: Set<Function>; };
+            },
+            fakeClipboard: undefined,
+            wrapPluginCode: (code: string, filename = "RuntimeGenerated.plugin.js") => { return convertPlugin(code, filename, false); },
+            queuedPlugins: [],
+        };
+        window.BdCompatLayer = windowBdCompatLayer;
+
+        window.GeneratedPlugins = [];
+        const ReImplementationObject = {
+            // request: (url, cb) => {
+            //     cb({ err: "err" }, undefined, undefined);
+            // },
+            fs: {},
+            path: {},
+            https: {
+                get_(url: string, options, cb: (em: typeof FakeEventEmitter.prototype) => void) {
+                    const ev = new ReImplementationObject.events.EventEmitter();
+                    const ev2 = new ReImplementationObject.events.EventEmitter();
+                    const fetchResponse = fetchWithCorsProxyFallback(url, { ...options, method: "get" }, proxyUrl);
+                    fetchResponse.then(async x => {
+                        ev2.emit("response", ev);
+                        if (x.body) {
+                            const reader = x.body.getReader();
+                            let result = await reader.read();
+                            while (!result.done) {
+                                ev.emit("data", result.value);
+                                result = await reader.read();
+                            }
+                        }
+                        ev.emit("end", Object.assign({}, x, {
+                            statusCode: x.status,
+                            headers: Object.fromEntries(x.headers.entries()),
+                        }));
+                    });
+                    cb(ev);
+                    fetchResponse.catch(reason => {
+                        // eslint-disable-next-line @typescript-eslint/dot-notation
+                        if (ev2.callbacks["error"]) // https://nodejs.org/api/http.html#class-httpclientrequest "For backward compatibility, res will only emit 'error' if there is an 'error' listener registered."
+                            ev2.emit("error", reason);
+                    });
+                    return ev2;
+                },
+                get get() {
+                    if (Settings.plugins[thePlugin.name].enableExperimentalRequestPolyfills === true)
+                        return this.get_;
+                    return undefined;
+                }
+            },
+            get request_() {
+                const fakeRequest = function (url: string, cb = (...args) => { }, headers = {}) {
+                    const stuff = { theCallback: cb };
+                    if (typeof headers === "function") {
+                        // @ts-ignore
+                        cb = headers;
+                        headers = stuff.theCallback;
+                    }
+                    // @ts-ignore
+                    delete stuff.theCallback;
+                    // cb({ err: "err" }, undefined, undefined);
+                    const fetchOut = fetchWithCorsProxyFallback(url, { ...headers, method: "get" }, proxyUrl);
+                    // uh did somebody say "compatibility"? no? I didn't hear that either.
+                    fetchOut.then(async x => {
+                        // cb(undefined, x, await x.text());
+                        cb(undefined, Object.assign({}, x, {
+                            statusCode: x.status,
+                            headers: Object.fromEntries(x.headers.entries()),
+                        }), await x.text()); // shouldn't this be arrayBuffer?
+                    });
+                    fetchOut.catch(x => {
+                        cb(x, undefined, undefined);
+                    });
+                };
+                // fakeRequest.stuffHere = function () {}
+                fakeRequest.get = function (url: string, cb = (...args) => { }, options = {}) {
+                    return this(url, cb, { ...options, method: "get" });
+                };
+                return fakeRequest;
+            },
+            get request() {
+                if (Settings.plugins[thePlugin.name].enableExperimentalRequestPolyfills === true)
+                    return this.request_;
+                return undefined;
+            },
+            get events() {
+                const Original = FakeEventEmitter;
+                const Copy = class extends Original { };
+                Object.defineProperty(Copy, "EventEmitter", { value: Copy });
+                return Copy as typeof Copy & { EventEmitter: typeof FakeEventEmitter };
+            },
+            electron: {},
+            process: {
+                env: {
+                    // HOME: "/home/fake",
+                    _home_secret: "",
+                    get HOME() {
+                        const target = "/home/fake";
+                        FSUtils.mkdirSyncRecursive(target);
+                        return target;
+                    },
+                    NODE_ENV: "production",
+                },
+            },
+        };
+        reimplementationsReady.resolve();
+        const FakeRequireRedirect = (name: keyof typeof ReImplementationObject) => {
+            return ReImplementationObject[name];
+        };
+        const BdApiReImplementation = createGlobalBdApi();
+        window.BdApi = BdApiReImplementation;
+        if (PluginMeta[PLUGIN_NAME].userPlugin === true) {
+            BdApiReImplementation.UI.showConfirmationModal("Error", "BD Compatibility Layer will not work as a user plugin!", { cancelText: null, onCancel: null });
+            compat_logger.warn("Removing settings tab...");
+            unInjectSettingsTab();
+            compat_logger.warn("Removing compat layer...");
+            delete window.BdCompatLayer;
+            compat_logger.warn("Removing BdApi...");
+            cleanupGlobal();
+            delete window.BdApi;
+            throw new Error("BD Compatibility Layer will not work as a user plugin!");
+        }
+        // window.BdApi.UI = new UI();
+        // @ts-ignore
+        window.require = FakeRequireRedirect;
+        this.originalBuffer = window.Buffer;
+        window.Buffer = BdApiReImplementation.Webpack.getModule(x => x.INSPECT_MAX_BYTES)?.Buffer;
+        if (typeof window.global === "undefined") {
+            this.globalWasNotExisting = true;
+            this.globalDefineWasNotExisting = true;
+        } else if (typeof window.global.define === "undefined") {
+            this.globalDefineWasNotExisting = true;
+        }
+        window.global = window.global || globalThis;
+        window.global.define = window.global.define || function () { };
+        // window.BdApi.ReqImpl = ReImplementationObject;
+        windowBdCompatLayer.fakeClipboard = (() => {
+            const try1 = BdApiReImplementation.Webpack.getModule(x => x.clipboard);
+            if (try1) {
+                return try1.clipboard;
+            }
+            return {
+                copy: copyToClipboard,
+            };
+        })();
+
+        const injectedAndPatched_ = new Promise<void>((resolve, reject) => {
+            ReactUtils_filler.setup({ React: React });
+            addDiscordModules(proxyUrl).then(DiscordModulesInjectorOutput => {
+                const DiscordModules = DiscordModulesInjectorOutput.output;
+                const makeOverrideOriginal = Patcher.makeOverride;
+                Patcher.makeOverride = function makeOverride(...args) {
+                    const ret = makeOverrideOriginal.call(this, ...args);
+                    Object.defineProperty(ret, "name", { value: "BDPatcher" });
+                    return ret;
+                };
+                const makePatchOriginal = Object.getOwnPropertyDescriptor(Patcher, "makePatch")!.value;
+                Object.defineProperty(Patcher, "makePatch", { // this is fragile, I hate it
+                    value: function makePatch(...args) {                      // but this possibly solves performance issues
+                        const [module, methodName] = args;
+                        if (module && methodName) {
+                            const desc = Object.getOwnPropertyDescriptor(module, methodName);
+                            if (desc && desc.get && !desc.set && desc.configurable) {
+                                const value = desc.get.call(module);
+                                Object.defineProperty(module, methodName, {
+                                    value: value,
+                                    writable: true,
+                                    configurable: true,
+                                    enumerable: desc.enumerable
+                                });
+                                compat_logger.debug(`Converted ${methodName} from getter to value for patching`);
+                            }
+                            else if (desc && !desc.writable && desc.configurable && !desc.get) {
+                                Object.defineProperty(module, methodName, {
+                                    writable: true
+                                });
+                            }
+                        }
+                        return makePatchOriginal.call(this, ...args);
+                    }
+                });
+                Patcher.setup(DiscordModules);
+                addContextMenu(DiscordModules, proxyUrl).then(ContextMenuInjectorOutput => {
+                    const ContextMenu = ContextMenuInjectorOutput.output;
+                    BdApiReImplementation.ContextMenu = ContextMenu;
+                    resolve();
+                }, reject);
+            }, reject);
+        });
+        const injectedAndPatched = new Promise((resolve, reject) => {
+            checkCorsProxyUrlCsp().then(result => {
+                if (!result) {
+                    compat_logger.error("CORS Proxy CSP rejected.");
+                    reject();
+                    return;
+                }
+                injectedAndPatched_.then(resolve, reject);
+            });
+        });
+
+        const fakeLoading = document.createElement("span");
+        fakeLoading.style.display = "none";
+        fakeLoading.id = "bd-loading-icon";
+        document.body.appendChild(fakeLoading);
+        setTimeout(() => {
+            fakeLoading.remove();
+        }, 500);
+        const fakeBdHead = document.createElement("bd-head");
+        document.body.appendChild(fakeBdHead);
+        const fakeBdStyles = document.createElement("bd-styles");
+        fakeBdHead.appendChild(fakeBdStyles);
+        const fakeBdScripts = document.createElement("bd-scripts");
+        fakeBdHead.appendChild(fakeBdScripts);
+        // const checkInterval = setInterval(() => {
+        //     if (window.BdApi.ReqImpl.fs === undefined)
+        //         return;
+        //     clearInterval(checkInterval);
+        Promise.all([windowBdCompatLayer.fsReadyPromise.promise, injectedAndPatched]).then(() => {
+            windowBdCompatLayer.Router?.listeners.add(windowBdCompatLayer.mainRouterListener);
+            const observer = new MutationObserver(mutations => mutations.forEach(m => window.GeneratedPlugins.forEach(p => BdApiReImplementation.Plugins.isEnabled(p.name) && p.instance.observer?.(m))));
+            observer.observe(document, {
+                childList: true,
+                subtree: true
+            });
+            windowBdCompatLayer.mainObserver = observer;
+            const localFs = window.require("fs");
+            if (!localFs.existsSync(BdApiReImplementation.Plugins.folder)) {
+                // localFs.mkdirSync(BdApiReimpl.Plugins.rootFolder);
+                // localFs.mkdirSync(BdApiReimpl.Plugins.folder);
+                // Utils.mkdirSyncRecursive(BdApiReImplementation.Plugins.folder);
+                FSUtils.mkdirSyncRecursive(BdApiReImplementation.Plugins.folder);
+            }
+            for (const key in this.options) {
+                if (Object.hasOwnProperty.call(this.options, key)) {
+                    if (Settings.plugins[this.name][key] && key.startsWith("pluginUrl")) {
+                        try {
+                            const url = Settings.plugins[this.name][key];
+                            // const filenameFromUrl = url.split("/").pop();
+                            const response = simpleGET(proxyUrl + url);
+                            const filenameFromUrl = response.responseURL
+                                .split("/")
+                                .pop();
+                            // this.convertPlugin(this.simpleGET(proxyUrl + url).responseText, filenameFromUrl).then(plugin => {
+
+                            localFs.writeFileSync(
+                                BdApiReImplementation.Plugins.folder +
+                                "/" +
+                                filenameFromUrl,
+                                response.responseText
+                            );
+                        } catch (error) {
+                            compat_logger.error(
+                                error,
+                                "\nWhile loading: " +
+                                Settings.plugins[this.name][key]
+                            );
+                        }
+                    }
+                }
+            }
+
+            const pluginFolder = localFs
+                .readdirSync(BdApiReImplementation.Plugins.folder)
+                .sort();
+            const plugins = pluginFolder.filter(x =>
+                x.endsWith(".plugin.js")
+            );
+            for (let i = 0; i < plugins.length; i++) {
+                const element = plugins[i];
+                const pluginJS = localFs.readFileSync(
+                    BdApiReImplementation.Plugins.folder + "/" + element,
+                    "utf8"
+                );
+                convertPlugin(pluginJS, element, true, BdApiReImplementation.Plugins.folder).then(plugin => {
+                    addCustomPlugin(plugin);
+                });
+            }
+        });
+        BdApiReImplementation.DOM.addStyle("OwOStylesOwO", `
+            .custom-notification {
+                display: flex;
+                flex-direction: column;
+                position: absolute;
+                bottom: 20px; right: 20px;
+                width: 440px; height: 270px;
+                overflow: hidden;
+                background-color: var(--modal-background);
+                color: white;
+                border-radius: 5px;
+                box-shadow: var(--legacy-elevation-border),var(--legacy-elevation-high);
+                animation: 1s slide cubic-bezier(0.39, 0.58, 0.57, 1);
+                z-index: 1;
+            }
+            @keyframes slide {
+                0% {
+                    right: -440px;
+                }
+                100% {
+                    right: 20px;
+                }
+            }
+            .custom-notification.close {
+                animation: 1s gobyebye cubic-bezier(0.39, 0.58, 0.57, 1) forwards;
+                right: 20px;
+            }
+
+            @keyframes gobyebye {
+                0% {
+                    right: 20px;
+                }
+                100% {
+                    right: -440px;
+                }
+            }
+            .custom-notification .top-box {padding: 16px;}
+            .custom-notification .notification-title {font-size: 20px; font-weight: bold;}
+            .custom-notification .content {
+                padding: 0 16px 20px;
+                flex: 1 1 auto;
+                overflow: hidden;
+            }
+            .custom-notification .bottom-box {
+                background-color: var(--modal-footer-background);
+                padding: 16px;
+                display: flex;
+                justify-content: flex-end;
+                align-items: center;
+            }
+            .custom-notification .confirm-button {
+                background-color: #007bff;
+                color: white;
+                border-radius: 5px;
+                padding: 5px 10px;
+                margin: 0 5px;
+            }
+            .custom-notification .cancel-button {
+                background-color: red;
+                color: white;
+                border-radius: 5px;
+                padding: 5px 10px;
+                margin: 0 5px;
+            }
+            .button-with-svg {
+                position: absolute;
+                right: 15px;
+                margin-top: -0px !important;
+                background: transparent;
+            }
+        `);
+        // BdApiReImplementation.DOM.addStyle("bd-compat-layer-stuff", '.bd-compat-setting > div > h2 { display: none; } .bd-compat-setting label { height: 0px; width: 0px; } .bd-compat-setting div[class^="labelRow_"] { height: 0px; }');
+        BdApiReImplementation.DOM.addStyle("bd-compat-layer-stuff", ".bd-compat-setting .vc-plugins-setting-title { display: none; }");
+        BdApiReImplementation.DOM.addStyle("bd-compat-layer-fs", `
+            .vc-bdcompat-fs-explorer-container {
+                display: flex;
+                flex-direction: column;
+                height: 100%;
+                border-radius: 0.5rem;
+                overflow: hidden;
+            }
+
+            .vc-bdcompat-fs-toolbar {
+                display: flex;
+                align-items: center;
+                padding: 0.5rem 0.75rem;
+                gap: 0.75rem;
+            }
+
+            .vc-bdcompat-fs-nav-buttons {
+                display: flex;
+                gap: 0.25rem;
+            }
+
+            .vc-bdcompat-fs-address-bar {
+                display: flex;
+                align-items: center;
+                flex: 1;
+                padding: 0.25rem 0.5rem;
+                border-radius: 0.25rem;
+            }
+
+            .vc-bdcompat-fs-address-label {
+                margin-right: 0.5rem;
+            }
+
+            .vc-bdcompat-fs-breadcrumb {
+                cursor: pointer;
+            }
+
+            .vc-bdcompat-fs-breadcrumb-separator {
+                margin: 0 0.25em;
+            }
+
+            .vc-bdcompat-fs-content-container {
+                display: flex;
+                flex: 1;
+                min-height: 0;
+                overflow: hidden;
+            }
+
+            .vc-bdcompat-fs-sidebar {
+                width: 7rem;
+                display: flex;
+                flex-direction: column;
+                transition: width 0.2s ease;
+            }
+
+            .vc-bdcompat-fs-sidebar-collapsed {
+                width: 2.5rem;
+            }
+
+            .vc-bdcompat-fs-tree-container {
+                flex: 1;
+                padding: 0.75rem;
+                overflow-y: auto;
+            }
+
+            .vc-bdcompat-fs-main-content {
+                flex: 1;
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
+            }
+
+            .vc-bdcompat-fs-sort-controls {
+                display: flex;
+                align-items: center;
+                padding: 0.5rem 1.5rem;
+                gap: 0.75rem;
+                font-size: 0.875rem;
+            }
+
+            .vc-bdcompat-fs-sort-button {
+                padding: 0.25rem 0.5rem;
+            }
+
+            .vc-bdcompat-fs-file-list {
+                flex: 1;
+                overflow: auto;
+                padding: 0 0.75rem 0.75rem;
+            }
+
+            .vc-bdcompat-fs-loading,
+            .vc-bdcompat-fs-empty-state {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                height: 100%;
+                padding: 2rem;
+                color: var(--text-muted);
+                text-align: center;
+                gap: 0.75rem;
+            }
+
+            .vc-bdcompat-fs-empty-state svg {
+                color: var(--text-muted);
+                opacity: 0.7;
+            }
+
+            .vc-bdcompat-fs-file-table {
+                width: 100%;
+                border-collapse: collapse;
+                table-layout: fixed;
+            }
+
+            .vc-bdcompat-fs-file-table th,
+            .vc-bdcompat-fs-file-table td {
+                text-align: left;
+                padding: 0.5rem 0.75rem;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+                box-sizing: border-box;
+            }
+
+            .vc-bdcompat-fs-file-table tr {
+                display: table-row;
+            }
+
+            .vc-bdcompat-fs-file-table td,
+            .vc-bdcompat-fs-file-table th {
+                display: table-cell;
+            }
+
+            .vc-bdcompat-fs-file-table td {
+                vertical-align: middle;
+            }
+
+            .vc-bdcompat-fs-file-row {
+                cursor: pointer;
+                transition: background-color 0.2s ease;
+            }
+
+            .vc-bdcompat-fs-file-name {
+                display: flex;
+                align-items: center;
+                gap: 0.5em;
+            }
+
+            .vc-bdcompat-fs-file-name svg {
+                color: var(--text-muted);
+                flex-shrink: 0;
+            }
+
+            .vc-bdcompat-fs-status-bar {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 0.25rem 0.75rem;
+            }
+
+            .vc-bdcompat-fs-explorer-card {
+                margin-top: 1rem;
+                overflow: hidden;
+            }
+
+            .vc-bdcompat-fs-tree-header {
+                padding: 0.5rem 0.75rem;
+                margin-bottom: 0.5rem;
+            }
+
+            .vc-bdcompat-fs-tree-content {
+                overflow-y: auto;
+                padding: 0 0.25rem;
+            }
+
+            .vc-bdcompat-fs-tree-item {
+                padding: 0.125rem 0;
+                border-radius: 0.25rem;
+            }
+
+            .vc-bdcompat-fs-folder-row,
+            .vc-bdcompat-fs-file-row {
+                display: flex;
+                align-items: center;
+                padding: 0.25rem 0.5rem;
+                cursor: pointer;
+                color: var(--text-muted);
+            }
+
+            .vc-bdcompat-fs-folder-toggle {
+                width: 1rem;
+                margin-right: 0.25rem;
+                display: inline-block;
+                text-align: center;
+                flex-shrink: 0;
+            }
+
+            .vc-bdcompat-fs-file-icon {
+                margin-right: 0.375rem;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+
+            .vc-bdcompat-fs-item-name {
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                flex: 1;
+            }
+
+            .vc-bdcompat-fs-children-container {
+                margin-left: 1rem;
+            }
+        `);
+    },
+    async stop() {
+        compat_logger.warn("Disabling observer...");
+        window.BdCompatLayer.mainObserver.disconnect();
+        compat_logger.warn("Removing onSwitch listener...");
+        window.BdCompatLayer.Router.listeners.delete(window.BdCompatLayer.mainRouterListener);
+        compat_logger.warn("UnPatching context menu...");
+        getGlobalApi().Patcher.unpatchAll("ContextMenuPatcher");
+        compat_logger.warn("Removing plugins...");
+        await removeAllCustomPlugins();
+        compat_logger.warn("Removing added css...");
+        getGlobalApi().DOM.removeStyle("OwOStylesOwO");
+        getGlobalApi().DOM.removeStyle("bd-compat-layer-stuff");
+        getGlobalApi().DOM.removeStyle("bd-compat-layer-fs");
+        compat_logger.warn("Removing settings tab...");
+        unInjectSettingsTab();
+        // console.warn("Freeing blobs...");
+        // Object.values(window.GeneratedPluginsBlobs).forEach(x => {
+        //     URL.revokeObjectURL(x);
+        //     delete window.GeneratedPluginsBlobs[x];
+        // });
+        // URL.revokeObjectURL(window.BdCompatLayer.contextMenuBlobUrl);
+        // URL.revokeObjectURL(window.BdCompatLayer.discordModulesBlobUrl);
+        if (this.globalDefineWasNotExisting === true) {
+            compat_logger.warn("Removing global.define...");
+            delete window.global.define;
+        }
+        if (this.globalWasNotExisting === true) {
+            compat_logger.warn("Removing global...");
+            // @ts-ignore
+            delete window.global;
+        }
+        compat_logger.warn("Removing compat layer...");
+        delete window.BdCompatLayer;
+        compat_logger.warn("Removing BdApi...");
+        cleanupGlobal();
+        delete window.BdApi;
+        if (window.zip) {
+            compat_logger.warn("Removing ZIP...");
+            delete window.zip;
+        }
+        compat_logger.warn("Removing FileSystem...");
+        delete window.BrowserFS;
+        compat_logger.warn("Restoring buffer...");
+        window.Buffer = this.originalBuffer as BufferConstructor;
+    },
+};
+
+export default definePlugin({
+    name: "BD Compatibility Layer",
+    ...thePlugin
+} as PluginDef);

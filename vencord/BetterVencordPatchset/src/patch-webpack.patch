@@ -1,0 +1,12 @@
+--- base/Vencord/src/webpack/patchWebpack.ts	2025-11-03 22:27:50.061134558 +0100
++++ dist/Vencord/src/webpack/patchWebpack.ts	2025-11-03 22:28:03.868141444 +0100
+@@ -207,7 +207,8 @@
+                         Object.defineProperty(exports, key, {
+                             enumerable: true,
+                             configurable: true,
+-                            get: definition[key],
++                            get: () => definition[key](),
++                            set: v => { definition[key] = () => v; },
+                         });
+                     }
+                 }

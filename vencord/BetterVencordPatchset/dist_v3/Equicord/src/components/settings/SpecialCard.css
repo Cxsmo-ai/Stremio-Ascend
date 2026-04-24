@@ -1,0 +1,167 @@
+.vc-invite-button,
+.vc-donate-button {
+    overflow: visible !important;
+    color: black;
+    background-color: color-mix(in srgb, #ED87A9 25%, pink);
+}
+
+.vc-invite-button:hover,
+.vc-donate-button:hover {
+    overflow: visible !important;
+    color: black;
+    background-color: color-mix(in srgb, #ED87A9 50%, pink);
+}
+
+.vc-invite-support-button,
+.vc-donate-support-button {
+    overflow: visible !important;
+    color: black;
+    background-color: color-mix(in srgb, #c3a3ce 25%, rgb(240 178 240));
+}
+
+.vc-invite-support-button:hover,
+.vc-donate-support-button:hover {
+    overflow: visible !important;
+    color: black;
+    background-color: color-mix(in srgb, #c3a3ce 50%, rgb(240 178 240));
+}
+
+.vc-translate-button {
+    overflow: visible !important;
+    color: black;
+    background-color: color-mix(in srgb, #575757 50%, rgb(255 255 255));
+}
+
+.vc-translate-button:hover {
+    overflow: visible !important;
+    color: black;
+    background-color: color-mix(in srgb, #575757 50%, rgb(201 201 201));
+}
+
+.vc-invite-link {
+    width: 16px;
+    height: 16px;
+    margin-left: 8px;
+    flex-shrink: 0;
+}
+
+.vc-contrib-button {
+    overflow: visible !important;
+    margin-top: 1em;
+    color: black;
+    background-color: color-mix(in srgb, #EDCC87 60%, lightyellow);
+}
+
+.vc-contrib-button:hover {
+    color: black;
+    background-color: color-mix(in srgb, #EDCC87 75%, lightyellow);
+}
+
+.vc-contrib-github {
+    width: 24px;
+    height: 24px;
+    flex-shrink: 0;
+    transition: transform 0.3s;
+}
+
+.vc-invite-button .vc-invite-link,
+.vc-contrib-button .vc-contrib-github,
+.vc-donate-button .vc-heart-icon,
+.vc-invite-support-button .vc-invite-link,
+.vc-donate-support-button .vc-heart-icon {
+    transition: transform 0.3s;
+    margin-right: 0.5em;
+}
+
+.vc-invite-button:hover .vc-invite-link,
+.vc-contrib-button:hover .vc-contrib-github,
+.vc-donate-button:hover .vc-heart-icon,
+.vc-invite-support-button:hover .vc-invite-link,
+.vc-donate-support-button:hover .vc-heart-icon {
+    transform: scale(1.1);
+    z-index: 10;
+    position: relative;
+}
+
+.vc-special-card-special {
+    padding: 1em 1.5em;
+    margin-bottom: 1em;
+    background-size: cover;
+    background-position: center;
+}
+
+.vc-special-card-flex {
+    display: flex;
+    flex-direction: row;
+}
+
+.vc-special-card-flex-main {
+    width: 100%;
+}
+
+.vc-special-title {
+    color: black;
+}
+
+.vc-special-subtitle {
+    color: black;
+    font-size: 1.2em;
+    font-weight: bold;
+    margin-top: 0.5em;
+}
+
+.vc-special-text {
+    color: black;
+    font-size: 1em;
+    margin-top: .75em;
+    white-space: pre-line;
+}
+
+.vc-special-seperator {
+    margin-top: .75em;
+    border-top: 1px solid white;
+    opacity: 0.4;
+}
+
+.vc-special-hyperlink {
+    margin-top: 1em;
+    cursor: pointer;
+}
+
+.vc-special-hyperlink-text {
+    color: black;
+    font-size: 1em;
+    font-weight: bold;
+    text-align: center;
+    transition: text-decoration 0.5s;
+    cursor: pointer;
+}
+
+.vc-special-hyperlink:hover .vc-special-hyperlink-text {
+    text-decoration: underline;
+}
+
+.vc-special-image-container {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    margin-left: 1em;
+    flex-shrink: 0;
+    width: 100px;
+    height: 100px;
+    border-radius: 50%;
+}
+
+.vc-special-image {
+    width: 65%;
+}
+
+.vc-translate-modal-icon {
+    margin: auto;
+    width: 60px;
+}
+
+.vc-translate-modal-paragraph {
+    padding: 12px;
+    text-align: center;
+}

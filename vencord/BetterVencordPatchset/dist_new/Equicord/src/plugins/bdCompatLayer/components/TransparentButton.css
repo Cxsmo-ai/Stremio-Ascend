@@ -1,0 +1,17 @@
+.bv-transparent-button {
+    background-color: transparent;
+    border: none;
+    padding: 10px 20px;
+    color: #333;
+    cursor: pointer;
+    transition: background-color 0.3s ease-in-out, color 0.3s ease-in-out;
+}
+  
+.bv-transparent-button.hovered {
+    background-color: #add8e680;
+    color: #fff;
+}
+  
+.bv-transparent-button.clicked {
+    background-color: #80808080;
+}

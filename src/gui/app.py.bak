@@ -1,0 +1,1230 @@
+import customtkinter as ctk
+import webbrowser
+import threading
+import time
+from tkinter import messagebox
+from PIL import Image
+import logging
+
+from src.core.config import load_config, save_config
+from src.core.controller import StremioController
+from src.core.discovery import ADBDiscovery
+import asyncio 
+
+from src.core.tmdb import TMDBClient
+from src.core.skip_manager import SkipManager
+from src.core.aniskip import AniskipClient
+from src.core.mal_mapper import MalMapper
+from src.core.trakt import TraktClient
+from src.rpc.discord_client import DiscordRPC
+from src.web.server import run_server
+import subprocess
+import sys
+import os
+
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
+
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("Stremio Ascend (RPC & IntroDB)")
+        self.geometry("900x600")
+        
+        # Data
+        self.config = load_config()
+        self.controller = StremioController(self.config["adb_host"], self.config["adb_port"])
+        self.rpc = DiscordRPC(self.config.get("discord_client_id", "1214732348508733520"))
+        self.tmdb_key = self.config.get("tmdb_api_key", "")
+        self.tmdb = TMDBClient(self.tmdb_key)
+        self.skip_manager = SkipManager()
+        
+        # Aniskip Init
+        self.aniskip = AniskipClient()
+        self.mal_client_id = self.config.get("mal_client_id", "")
+        self.mal_mapper = MalMapper(self.mal_client_id)
+        self.mal_id_cache = {} # Cache for title -> mal_id
+        
+        # Trakt Init
+        self.trakt = TraktClient(
+            client_id=self.config.get("trakt_client_id"),
+            access_token=self.config.get("trakt_access_token"),
+            refresh_token=self.config.get("trakt_refresh_token")
+        )
+        
+        # --- IntroDB Client REMOVED for Lite ---
+        
+        self.running = False
+        self.current_poster = None
+        self.last_image_url = None
+        self.device_name = "Android TV"
+        self.last_rpc_payload = {}
+        
+        # Thread-safe state for Web Server
+        self.shared_state = {
+            "title": "Ready to Play",
+            "subtitle": "Waiting...",
+            "progress": 0.0,
+            "image_url": None,
+            "connected": False,
+            "device": "Disconnected",
+            "is_playing": False
+        }
+        
+        # Start Web Server
+        threading.Thread(target=run_server, args=(self,), daemon=True).start()
+        
+        self.rpc_fail_count = 0 # Initialize fail tracker
+        
+        # New Config Defaults
+        if "show_device_name" not in self.config:
+            self.config["show_device_name"] = True
+
+        # --- Layout Configuration ---
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        # --- Sidebar (Left) ---
+        self.sidebar_frame = ctk.CTkScrollableFrame(self, width=300, corner_radius=0, fg_color="#18181A") # Matte Black
+        self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
+        # ScrollableFrame doesn't need grid_propagate(False) as it manages its own size
+
+        # Logo
+        self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="STREMIO ASCEND", font=("Segoe UI", 26, "bold"), text_color="#8A5CF5")
+        self.logo_label.grid(row=0, column=0, padx=30, pady=(30, 0))
+        
+        self.lbl_sub1 = ctk.CTkLabel(self.sidebar_frame, text="RPC & Intro Skip", font=("Segoe UI", 18, "bold"), text_color="#DDD")
+        self.lbl_sub1.grid(row=1, column=0, padx=30, pady=(0, 5))
+        
+        self.lbl_sub2 = ctk.CTkLabel(self.sidebar_frame, text="Powered by introdb.app", font=("Segoe UI", 15), text_color="#D0D0D0", cursor="hand2")
+        self.lbl_sub2.grid(row=2, column=0, padx=30, pady=(0, 20))
+        self.lbl_sub2.bind("<Button-1>", lambda e: webbrowser.open("https://introdb.app"))
+        self.lbl_sub2.bind("<Enter>", lambda e: self.lbl_sub2.configure(text_color="#8A5CF5"))
+        self.lbl_sub2.bind("<Leave>", lambda e: self.lbl_sub2.configure(text_color="#D0D0D0"))
+
+        # Device Selection
+        self.lbl_device = ctk.CTkLabel(self.sidebar_frame, text="TARGET DEVICE", anchor="w", font=("Segoe UI", 11, "bold"), text_color="#666")
+        self.lbl_device.grid(row=3, column=0, padx=30, pady=(10, 5), sticky="w")
+        
+        self.device_var = ctk.StringVar(value=self.config["adb_host"])
+        self.option_device = ctk.CTkOptionMenu(self.sidebar_frame, variable=self.device_var, values=[self.config["adb_host"]], 
+                                             fg_color="#2A2A2E", button_color="#333", button_hover_color="#444", text_color="#EEE", font=("Segoe UI", 12), height=35)
+        self.option_device.grid(row=4, column=0, padx=(25, 5), pady=0, sticky="ew")
+        
+        # Quick Connect Button (Small)
+        self.btn_quick_conn = ctk.CTkButton(self.sidebar_frame, text="➜", width=30, height=35, command=self.connect_adb,
+                                            fg_color="#333", hover_color="#444")
+        self.btn_quick_conn.grid(row=4, column=1, padx=(0, 25), pady=0)
+        
+        # Configure grid for 2 columns in row 4
+        self.sidebar_frame.grid_columnconfigure(0, weight=1)
+        self.sidebar_frame.grid_columnconfigure(1, weight=0)
+
+        self.btn_scan = ctk.CTkButton(self.sidebar_frame, text="SCAN NETWORK", command=self.scan_network, 
+                                      fg_color="transparent", border_width=1, border_color="#333", text_color="#999", hover_color="#222", font=("Segoe UI", 10, "bold"), height=30)
+        self.btn_scan.grid(row=5, column=0, padx=25, pady=10, sticky="ew")
+
+        # Connect Button (Solid)
+        self.btn_connect = ctk.CTkButton(self.sidebar_frame, text="CONNECT ADB", command=self.connect_adb,
+                                         fg_color="#333", hover_color="#444", text_color="#EEE", font=("Segoe UI", 11, "bold"), height=35, corner_radius=6)
+        self.btn_connect.grid(row=6, column=0, padx=25, pady=(5, 20), sticky="ew")
+
+        # Status Indicators
+        self.lbl_connection = ctk.CTkLabel(self.sidebar_frame, text="ADB: Disconnected", text_color="#FF4B4B", font=("Segoe UI", 12, "bold"))
+        self.lbl_connection.grid(row=7, column=0, padx=25, pady=2, sticky="w")
+
+        self.lbl_rpc = ctk.CTkLabel(self.sidebar_frame, text="RPC: Inactive", text_color="#666", font=("Segoe UI", 12))
+        self.lbl_rpc.grid(row=5, column=0, padx=25, pady=2, sticky="e")
+
+        # --- Discord Ad (Row 6) ---
+        try:
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) # src/
+            img_path = os.path.join(base_dir, "assets", "discord_ad.png")
+            if os.path.exists(img_path):
+                pil_img = Image.open(img_path)
+                w, h = pil_img.size
+                target_w = 260 # Bigger
+                target_h = int(h * (target_w / w))
+                
+                ad_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(target_w, target_h))
+                
+                self.btn_ad = ctk.CTkButton(self.sidebar_frame, text="", image=ad_img, 
+                                            command=lambda: webbrowser.open("https://discord.gg/njSKPUQtFa"),
+                                            fg_color="transparent", hover_color="#222", corner_radius=10)
+                self.btn_ad.grid(row=6, column=0, padx=10, pady=(10, 10))
+                print("DEBUG: Ad Loaded Successfully")
+        except Exception as e:
+            print(f"Failed to load ad: {e}")
+            messagebox.showerror("Ad Fail", f"Path: {img_path}\nError: {e}")
+
+        # Control (Main Action)
+        self.btn_toggle_monitor = ctk.CTkButton(self.sidebar_frame, text="START RPC", command=self.toggle_monitor, 
+                                                fg_color="#8A5CF5", hover_color="#7B4EE0", height=50, font=("Segoe UI", 15, "bold"), corner_radius=10, text_color="white")
+        self.btn_toggle_monitor.grid(row=7, column=0, padx=25, pady=(20, 10), sticky="ew")
+
+        # Settings
+        self.var_show_device = ctk.BooleanVar(value=self.config.get("show_device_name", True))
+        self.chk_show_device = ctk.CTkSwitch(self.sidebar_frame, text="Show Name in RPC", variable=self.var_show_device, command=self.save_settings, 
+                                             font=("Segoe UI", 12), progress_color="#8A5CF5", button_color="#DDD", button_hover_color="#FFF")
+        self.chk_show_device.grid(row=8, column=0, padx=25, pady=(25, 10), sticky="ew")
+
+        # Profanity Filter Toggle
+        self.var_profanity = ctk.BooleanVar(value=self.config.get("profanity_filter", False))
+        self.chk_profanity = ctk.CTkSwitch(self.sidebar_frame, text="Block Profanity (Safe Mode)", variable=self.var_profanity, command=self.save_settings,
+                                           font=("Segoe UI", 12), progress_color="#8A5CF5", button_color="#DDD", button_hover_color="#FFF")
+        self.chk_profanity.grid(row=9, column=0, padx=25, pady=(0, 20), sticky="ew")
+        
+        # Auto Skip Toggle (Moved up)
+        # Skip Mode Selection
+        self.lbl_skip_mode = ctk.CTkLabel(self.sidebar_frame, text="Skip Mode", font=("Segoe UI", 12, "bold"), text_color="#AAA", anchor="w")
+        self.lbl_skip_mode.grid(row=10, column=0, padx=30, pady=(10, 0), sticky="w")
+        
+        self.skip_mode_var = ctk.StringVar(value=self.config.get("skip_mode", "off"))
+        self.opt_skip_mode = ctk.CTkOptionMenu(self.sidebar_frame, variable=self.skip_mode_var, values=["off", "auto", "button"], 
+                                             command=self.save_settings,
+                                             fg_color="#2A2A2E", button_color="#333", button_hover_color="#444", text_color="#EEE", font=("Segoe UI", 12))
+        self.opt_skip_mode.grid(row=11, column=0, padx=25, pady=(0, 5), sticky="ew")
+        
+        self.lbl_skip_msg = ctk.CTkLabel(self.sidebar_frame, text="", font=("Segoe UI", 14, "bold"), text_color="gray")
+        self.lbl_skip_msg.grid(row=12, column=0, padx=25, pady=(0, 20), sticky="ew")
+        
+        # IntroDB Section REMOVED
+        
+        # Adjust subsequent rows
+        # TMDB Key
+
+        
+        # Aniskip Settings
+        self.var_aniskip = ctk.BooleanVar(value=self.config.get("aniskip_enabled", False))
+        self.chk_aniskip = ctk.CTkSwitch(self.sidebar_frame, text="Enable Aniskip (Anime)", variable=self.var_aniskip, command=self.save_settings,
+                                           font=("Segoe UI", 12), progress_color="#8A5CF5", button_color="#DDD", button_hover_color="#FFF")
+        self.chk_aniskip.grid(row=12, column=0, padx=25, pady=(0, 0), sticky="ew")
+
+        # Aniskip Smart Filter (Prefer Later Skips)
+        self.var_aniskip_smart = ctk.BooleanVar(value=self.config.get("aniskip_smart", False))
+        self.chk_aniskip_smart = ctk.CTkSwitch(self.sidebar_frame, text="Fix Aniskip (Prefer Later)", variable=self.var_aniskip_smart, command=self.save_settings,
+                                               font=("Segoe UI", 10), progress_color="#8A5CF5", button_color="#DDD", button_hover_color="#FFF", height=20)
+        self.chk_aniskip_smart.grid(row=13, column=0, padx=40, pady=(0, 5), sticky="ew")
+
+        self.lbl_mal_id = ctk.CTkLabel(self.sidebar_frame, text="MAL CLIENT ID (For Aniskip)", anchor="w", font=("Segoe UI", 11, "bold"), text_color="#666")
+        self.lbl_mal_id.grid(row=14, column=0, padx=25, pady=(10, 0), sticky="ew")
+        
+        # MAL Frame
+        self.frame_mal = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        self.frame_mal.grid(row=15, column=0, padx=25, pady=(0, 20), sticky="ew")
+        
+        self.entry_mal_id = ctk.CTkEntry(self.frame_mal, placeholder_text="Enter MAL Client ID", height=35)
+        self.entry_mal_id.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        self.entry_mal_id.insert(0, self.config.get("mal_client_id", ""))
+        
+        self.btn_save_mal = ctk.CTkButton(self.frame_mal, text="💾", width=40, height=35, command=self.save_settings,
+                                          fg_color="#333", hover_color="#444")
+        self.btn_save_mal.pack(side="right")
+
+        # Trakt Section
+        self.lbl_trakt = ctk.CTkLabel(self.sidebar_frame, text="Trakt.tv Integration", font=("Segoe UI", 12, "bold"), text_color="#AAA", anchor="w")
+        self.lbl_trakt.grid(row=16, column=0, padx=30, pady=(10, 0), sticky="w")
+        
+        trakt_status = "Connected" if self.config.get("trakt_access_token") else "Not Connected"
+        trakt_color = "#2CC985" if self.config.get("trakt_access_token") else "gray"
+        
+        self.btn_trakt_auth = ctk.CTkButton(self.sidebar_frame, text=f"Login to Trakt ({trakt_status})", 
+                                          command=self.start_trakt_auth,
+                                          fg_color=trakt_color, hover_color="#1E8449" if trakt_color=="#2CC985" else "#555")
+        self.btn_trakt_auth.grid(row=17, column=0, padx=25, pady=(5, 5), sticky="ew")
+        
+        # Trakt Credentials (Optional if public but here we need them)
+        self.frame_trakt_creds = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        self.frame_trakt_creds.grid(row=18, column=0, padx=25, pady=(0, 20), sticky="ew")
+        
+        self.entry_trakt_id = ctk.CTkEntry(self.frame_trakt_creds, placeholder_text="Client ID", height=30, fg_color="#222")
+        self.entry_trakt_id.pack(fill="x", pady=(0, 2))
+        self.entry_trakt_id.insert(0, self.config.get("trakt_client_id", ""))
+        
+        self.entry_trakt_secret = ctk.CTkEntry(self.frame_trakt_creds, placeholder_text="Client Secret", height=30, fg_color="#222", show="*")
+        self.entry_trakt_secret.pack(fill="x", pady=(0, 2))
+        self.entry_trakt_secret.insert(0, self.config.get("trakt_client_secret", ""))
+
+        # TMDB Key
+        self.lbl_tmdb = ctk.CTkLabel(self.sidebar_frame, text="TMDB API KEY", anchor="w", font=("Segoe UI", 11, "bold"), text_color="#666")
+        self.lbl_tmdb.grid(row=19, column=0, padx=30, pady=(10, 5), sticky="w")
+        
+        # TMDB Frame
+        self.frame_tmdb = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        self.frame_tmdb.grid(row=20, column=0, padx=25, pady=0, sticky="ew")
+        
+        self.entry_tmdb = ctk.CTkEntry(self.frame_tmdb, fg_color="#222", border_color="#333", text_color="#FFF", height=35)
+        self.entry_tmdb.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        self.entry_tmdb.insert(0, self.config["tmdb_api_key"])
+        
+        self.btn_save_tmdb = ctk.CTkButton(self.frame_tmdb, text="💾", width=40, height=35, command=self.save_settings,
+                                           fg_color="#333", hover_color="#444")
+        self.btn_save_tmdb.pack(side="right")
+        
+        # Save
+        self.btn_save = ctk.CTkButton(self.sidebar_frame, text="SAVE CONFIG", command=self.save_settings, 
+                                      fg_color="transparent", text_color="#555", hover_color="#222", height=24, font=("Segoe UI", 10, "bold"))
+        self.btn_save.grid(row=21, column=0, padx=25, pady=15, sticky="ew")
+
+        # Web Remote Link
+        self.lbl_web = ctk.CTkLabel(self.sidebar_frame, text="WEB REMOTE", anchor="w", font=("Segoe UI", 11, "bold"), text_color="#666")
+        self.lbl_web.grid(row=23, column=0, padx=30, pady=(10, 5), sticky="w")
+
+        local_ip = self.get_local_ip()
+        self.entry_web = ctk.CTkEntry(self.sidebar_frame, fg_color="#222", border_color="#333", text_color="#2CC985", height=35)
+        self.entry_web.grid(row=24, column=0, padx=25, pady=0, sticky="ew")
+        self.entry_web.insert(0, f"http://{local_ip}:5466")
+        self.entry_web.configure(state="readonly")
+
+        # Restart Button
+        self.btn_restart = ctk.CTkButton(self.sidebar_frame, text="FORCE RESTART APP", command=self.restart_app,
+                                         fg_color="#C0392B", hover_color="#922B21", width=200, height=32)
+        self.btn_restart.grid(row=25, column=0, padx=20, pady=(20, 10))
+
+
+
+        # --- Main Content (Right) ---
+        self.main_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.main_frame.grid(row=0, column=1, sticky="nsew", padx=30, pady=30)
+        self.main_frame.grid_columnconfigure(0, weight=1)
+        
+        # Info Card (The "Glass" Panel)
+        self.info_frame = ctk.CTkFrame(self.main_frame, corner_radius=20, fg_color="#232323", border_width=1, border_color="#333333")
+        self.info_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # Poster Area (Placeholder Frame)
+        # We will put the image label inside this decorative frame
+        self.poster_frame = ctk.CTkFrame(self.info_frame, width=200, height=300, fg_color="#111111", corner_radius=15)
+        self.poster_frame.pack(pady=(40, 20))
+        self.poster_frame.pack_propagate(False) # Force size
+        
+        self.lbl_image = ctk.CTkLabel(self.poster_frame, text="", text_color="#555")
+        self.lbl_image.place(relx=0.5, rely=0.5, anchor="center")
+
+        # Title (Large & Bold)
+        self.lbl_title = ctk.CTkLabel(self.info_frame, text="Ready to Play", font=("Segoe UI", 32, "bold"), wraplength=500)
+        self.lbl_title.pack(pady=(10, 5))
+
+        # State & Progress
+        self.lbl_state = ctk.CTkLabel(self.info_frame, text="Waiting for device...", font=("Segoe UI", 16), text_color="#AAAAAA")
+        self.lbl_state.pack(pady=5)
+        
+        # Premium Progress Bar
+        self.progress_bar = ctk.CTkProgressBar(self.info_frame, width=450, height=12, corner_radius=6, progress_color="#8A5CF5", fg_color="#333333")
+        self.progress_bar.pack(pady=30)
+        self.progress_bar.set(0)
+        
+        # Playback Controls
+        self.controls_frame = ctk.CTkFrame(self.info_frame, fg_color="transparent")
+        self.controls_frame.pack(pady=10)
+
+        self.btn_prev = ctk.CTkButton(self.controls_frame, text="⏮", width=40, command=self.prev_track, fg_color="#333", hover_color="#444")
+        self.btn_prev.pack(side="left", padx=10)
+
+        self.btn_play = ctk.CTkButton(self.controls_frame, text="⏯", width=50, command=self.play_pause, fg_color="#8A5CF5", hover_color="#7B4EE0")
+        self.btn_play.pack(side="left", padx=10)
+
+        self.btn_stop = ctk.CTkButton(self.controls_frame, text="⏹", width=40, command=self.stop_playback, fg_color="#C0392B", hover_color="#E74C3C")
+        self.btn_stop.pack(side="left", padx=10)
+
+        self.btn_next = ctk.CTkButton(self.controls_frame, text="⏭", width=40, command=self.next_track, fg_color="#333", hover_color="#444")
+        self.btn_next.pack(side="left", padx=10)
+
+        # Dynamic Skip Button (Hidden by default)
+        self.btn_skip_action = ctk.CTkButton(self.controls_frame, text="SKIP", width=120, fg_color="#E67E22", hover_color="#D35400", 
+                                           command=lambda: print("Skip Wait"), font=("Segoe UI", 12, "bold"))
+        # self.btn_skip_action.pack(side="left", padx=10) # Packed dynamically
+
+        # Start RPC in monitor loop, not here
+        
+
+        
+    def get_local_ip(self):
+        import socket
+        try:
+            # Connect to a public DNS to find out local IP (doesn't actually connect)
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except:
+            return "127.0.0.1"
+
+    def save_settings(self):
+        try:
+            # Allow selecting "Name (IP)" or just "IP"
+            raw_val = self.device_var.get()
+            ip = raw_val.split("(")[-1].replace(")", "").strip()
+            self.config["adb_host"] = ip
+            self.config["tmdb_api_key"] = self.entry_tmdb.get().strip()
+            # Discord Client ID hidden/managed internally
+            if not self.config.get("discord_client_id"):
+                 self.config["discord_client_id"] = "1451010126495617106"
+                 
+            self.config["trakt_client_id"] = self.entry_trakt_id.get().strip()
+            self.config["trakt_client_secret"] = self.entry_trakt_secret.get().strip()
+            self.config["show_device_name"] = self.var_show_device.get()
+            self.config["profanity_filter"] = self.var_profanity.get()
+            # Duplicate line removed here via this replacement block
+            self.config["skip_mode"] = self.skip_mode_var.get()
+            
+            # Legacy Update
+            self.config["auto_skip"] = (self.config["skip_mode"] == "auto") 
+
+            # New Settings
+            self.config["aniskip_enabled"] = self.var_aniskip.get()
+            self.config["aniskip_smart"] = self.var_aniskip_smart.get()
+            self.config["mal_client_id"] = self.entry_mal_id.get().strip()
+            
+            # Update filters
+            self.skip_manager.smart_mode = self.config["aniskip_smart"]
+            self.skip_manager.enabled = (self.config["skip_mode"] != "off")
+            
+            # DISCORD HOT-SWAP Removed (ID is internal)
+            
+            # Update runtime config
+            self.controller.host = self.config["adb_host"]
+            self.tmdb.api_key = self.config["tmdb_api_key"]
+            self.rpc.client_id = self.config["discord_client_id"] # Update RPC too
+            
+            save_config(self.config)
+            print("DEBUG: Settings Saved Successfully")
+        except Exception as e:
+            print(f"ERROR: Save Failed: {e}")
+            from tkinter import messagebox
+            messagebox.showerror("Save Error", f"Could not save settings:\n{e}") 
+
+    def start_trakt_auth(self):
+        def auth_thread():
+            # Update credentials first
+            self.save_settings()
+            
+            # Re-init Trakt with new credentials
+            self.trakt = TraktClient(
+                client_id=self.config.get("trakt_client_id"),
+                client_secret=self.config.get("trakt_client_secret"),
+                access_token=self.config.get("trakt_access_token"),
+                refresh_token=self.config.get("trakt_refresh_token")
+            )
+            
+            if not self.trakt.client_id:
+                 self.btn_trakt_auth.configure(text="Missing Client ID!", fg_color="red")
+                 return
+
+            self.btn_trakt_auth.configure(text="Requesting Code...", state="disabled")
+            data = self.trakt.get_device_code()
+            if not data:
+                self.btn_trakt_auth.configure(text="Error connecting", fg_color="red", state="normal")
+                return
+                
+            code = data.get("user_code")
+            print(f"Trakt Code: {code}")
+            
+            # Copy to clipboard
+            self.clipboard_clear()
+            self.clipboard_append(code)
+            
+            self.btn_trakt_auth.configure(text=f"Code Copied: {code}", fg_color="#E67E22")
+            webbrowser.open(data.get("verification_url"))
+            
+            # Poll
+            res = self.trakt.poll_for_token(data.get("device_code"), data.get("interval", 5))
+            if isinstance(res, dict) and "access_token" in res:
+                self.config["trakt_access_token"] = res["access_token"]
+                self.config["trakt_refresh_token"] = res["refresh_token"]
+                self.trakt.set_auth(res["access_token"], res["refresh_token"])
+                self.save_settings()
+                self.btn_trakt_auth.configure(text="Trakt Connected!", fg_color="#2CC985", state="normal")
+            else:
+                self.btn_trakt_auth.configure(text="Auth Failed/Expired", fg_color="red", state="normal")
+
+        threading.Thread(target=auth_thread, daemon=True).start()
+
+    def connect_adb(self):
+        self.save_settings() # Auto-save on connect
+        threading.Thread(target=self._connect_adb_thread, daemon=True).start()
+
+    def _connect_adb_thread(self):
+        # Synchronous Call
+        self.controller.connect()
+        if self.controller.connected:
+            self.device_name = self.controller.get_device_name()
+            self.lbl_connection.configure(text=f"ADB: {self.device_name}", text_color="#2CC985") # Nice Green
+        else:
+            self.lbl_connection.configure(text="ADB: Disconnected", text_color="#FF4B4B") # Nice Red
+
+    def scan_network(self):
+        self.btn_scan.configure(state="disabled", text="Scanning...")
+        threading.Thread(target=self._scan_thread, daemon=True).start()
+
+    async def _scan_async(self):
+        # Suppress logging temporarily for smoother scan
+        logging.getLogger("stremio-rpc").setLevel(logging.CRITICAL)
+        try:
+             ips = await ADBDiscovery().scan_network()
+        finally:
+             logging.getLogger("stremio-rpc").setLevel(logging.DEBUG) # Restore
+        return ips
+
+    def scan_for_api(self):
+        # Synchronous scan returning list of dicts
+        ips = []
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            ips = loop.run_until_complete(self._scan_async())
+            loop.close()
+        except Exception as e:
+            print(f"Scan error: {e}")
+            ips = []
+
+        results = []
+        # Suppress controller logs too
+        logging.getLogger("stremio-rpc").setLevel(logging.CRITICAL)
+        
+        for ip in ips:
+            try:
+                tmp_ctrl = StremioController(ip, 5555)
+                # Attempt quick connect
+                if tmp_ctrl.connect():
+                    name = tmp_ctrl.get_device_name()
+                    results.append({"ip": ip, "name": name})
+                    try: tmp_ctrl.device.close()
+                    except: pass
+                else: 
+                     # If connect failed, maybe don't list it? Or list as Unknown?
+                     # Listing as Unknown is safer if it's just auth blocked
+                     # results.append({"ip": ip, "name": "Unknown"})
+                     pass 
+            except:
+                pass
+                
+        logging.getLogger("stremio-rpc").setLevel(logging.DEBUG) # Restore
+        return results
+
+    def _scan_thread(self):
+        devices = self.scan_for_api()
+        
+        final_list = []
+        for d in devices:
+            final_list.append(f"{d['name']} ({d['ip']})")
+            
+        if not final_list: final_list = ["No devices found"]
+        
+        self.option_device.configure(values=final_list)
+        if final_list and "No devices" not in final_list[0]:
+            self.device_var.set(final_list[0])
+            self.save_settings()
+            messagebox.showinfo("Scan", f"Found {len(devices)} devices!")
+        else:
+            messagebox.showinfo("Scan", "No devices found.")
+            
+        self.btn_scan.configure(state="normal", text="Scan Network")
+
+    def toggle_monitor(self):
+        if self.running:
+            self.running = False
+            self.btn_toggle_monitor.configure(text="START RPC", fg_color="#8A5CF5")
+            self.lbl_rpc.configure(text="RPC: Stopped")
+            
+            # Clear Discord Status immediately and Disconnect
+            if self.rpc:
+                try:
+                    self.rpc.clear()
+                    self.rpc.close() # Fully close
+                    print("DEBUG: RPC Closed on Stop")
+                except: pass
+            
+            # FORCE RESET: Create a completely fresh instance
+            # This solves the "pypresence loop closed" issue permanently
+            self.rpc = DiscordRPC(self.config["discord_client_id"])
+            print("DEBUG: DiscordRPC Instance Re-created")
+            
+            self.last_rpc_payload = {}
+            
+            # Reset UI
+            self.update_poster(None)
+            self.lbl_title.configure(text="Ready to Play")
+            self.lbl_state.configure(text="RPC Stopped", text_color="#AAAAAA")
+            self.progress_bar.set(0)
+            
+        else:
+            self.running = True
+            self.btn_toggle_monitor.configure(text="Stop RPC", fg_color="#C0392B") # Dark Red
+            self.lbl_rpc.configure(text="RPC: Running")
+            threading.Thread(target=self._monitor_loop, daemon=True).start()
+
+    # ... (skipping unchanged methods) ...
+
+
+    
+    def update_poster(self, image: Image.Image):
+        if image:
+            # Resize for the 200x300 frame
+            # TMDB posters are usually 1:1.5 ratio, so this should fit well.
+            ctk_img = ctk.CTkImage(light_image=image, dark_image=image, size=(200, 300))
+            self.lbl_image.configure(image=ctk_img, text="")
+            self.current_poster = ctk_img # Keep reference
+        else:
+            self.lbl_image.configure(image=None, text="Waiting...")
+
+    def apply_filter(self, text):
+        if not text: return text
+        # Check toggle (safely get value)
+        try:
+            if not self.var_profanity.get(): return text
+        except: return text
+
+        import re
+        # Basic list + specific user request
+        bad_words = [
+            "fuck", "shit", "bitch", "cunt", "asshole", "dick", "cock", "pussy", 
+            "whore", "slut", "bastard", "damn", "fucking", "motherfucker", "cocksman", "nigga", "nigger"
+        ]
+        # Regex to find words (case insensitive)
+        # We use word boundaries \b to avoid clobbering substring matches if desired, 
+        # but user said "every letter part of naughty word", usually means whole word masking.
+        # "Cocksman" is a whole word.
+        pattern = re.compile(r'\b(' + '|'.join([re.escape(w) for w in bad_words]) + r')\b', re.IGNORECASE)
+        return pattern.sub(lambda m: '*' * len(m.group()), text)
+
+    def play_pause(self):
+        threading.Thread(target=self.controller.play_pause, daemon=True).start()
+
+    def stop_playback(self):
+        threading.Thread(target=self.controller.stop, daemon=True).start()
+
+    def next_track(self):
+        threading.Thread(target=self.controller.next_track, daemon=True).start()
+
+    def prev_track(self):
+        threading.Thread(target=self.controller.prev_track, daemon=True).start()
+
+    def seek_forward(self):
+        threading.Thread(target=self.controller.seek_forward, daemon=True).start()
+
+    def seek_backward(self):
+        threading.Thread(target=self.controller.seek_backward, daemon=True).start()
+
+    def seek_to(self, target_ms):
+        current = self.shared_state.get("position_val", 0)
+        threading.Thread(target=self.controller.seek_to, args=(target_ms, int(current)), daemon=True).start()
+
+    # --- IntroDB Methods ---
+    # --- IntroDB Methods REMOVED ---
+
+    def toggle_skip(self, _=None):
+        # Deprecated - handled by save_settings via OptionMenu
+        pass
+
+    def _monitor_loop(self):
+        # Initialize RPC connection here (IN THIS THREAD) to avoid asyncio threading issues
+        # Initialize RPC connection here (IN THIS THREAD) to avoid asyncio threading issues
+        if self.config["discord_client_id"] and not self.rpc.connected:
+            try:
+                self.rpc.connect()
+            except: pass # Will retry in loop
+
+        # Update Instances
+        if self.tmdb_key != self.config["tmdb_api_key"]:
+             self.tmdb_key = self.config["tmdb_api_key"]
+             self.tmdb = TMDBClient(self.tmdb_key)
+             
+        self.mal_client_id = self.config.get("mal_client_id", "")
+        self.mal_mapper.client_id = self.mal_client_id
+             
+        if self.config["discord_client_id"] != self.rpc.client_id:
+            # If client ID changed, force RPC re-initialization
+            print("DEBUG: Discord Client ID changed. Re-initializing RPC.")
+            try:
+                self.rpc.close()
+            except: pass
+            self.rpc = DiscordRPC(self.config["discord_client_id"])
+            self.rpc.connected = False # Mark as disconnected to force reconnect below
+            
+        last_title = None
+
+        # Trakt Scrobble State
+        self.last_trakt_playing = False
+        self.last_trakt_progress = 0
+        self.trakt_scrobbled = False # Reset scrobble status for new item
+        
+        try:
+            while self.running:
+                # 1. Ensure Discord RPC Connection
+                if self.config["discord_client_id"] and not self.rpc.connected:
+                    print("DEBUG: RPC Disconnected. Attempting to connect...")
+                    try:
+                        self.rpc.connect()
+                    except Exception as e:
+                        print(f"DEBUG: RPC Connect Retry Failed: {e}")
+                        # Don't spam
+                        time.sleep(1)
+
+                # 2. Ensure ADB Connection
+                if not self.controller.connected:
+                    self.controller.connect()
+                    if self.controller.connected:
+                        self.device_name = self.controller.get_device_name()
+                
+                if self.controller.connected:
+                    status = self.controller.get_playback_status()
+                    
+                    title = status.get("title")
+                    state = status.get("state")
+                    position = status.get("position", 0)
+                    duration = status.get("duration", 0)
+                    search_query = title
+
+                    # 0. Custom Title Overrides (Apply BEFORE GUI update)
+                    if title == "MSNBC":
+                        title = "MS NOW"        # Output for GUI / RPC
+                        search_query = "MSNBC"  # Query for TMDB (to get image)
+                    
+                    image_url = None
+                    display_title = title # Default to raw if not cleaned
+                    display_state = state
+                    
+                    if title and state in ["playing", "paused"]:
+                         # Advanced Regex for Scene Releases (e.g. Show.Name.S01E01.1080p...)
+                        import re
+                        
+                        # Controller now extracts season/episode into status["season"] / status["episode"]
+                        # We can use that if available, but the regex logic below is also good for cleaning the title.
+                        # Let's keep the existing cleaning logic for 'clean_title', but use status S/E for Auto Skip.
+                        
+                        # 1. Try to find SxxExx pattern (most robust)
+                        # Looks for 'S01E01' or 's1e1' preceded by name
+                        match = re.search(r'(.*?)[\s\.]*[sS](\d+)[eE](\d+).*', title)
+                        
+                        # 2. Fallback: Try 1x01 pattern (common in some scrapers)
+                        if not match:
+                             match = re.search(r'(.*?)[\s\.]*(\d+)x(\d+).*', title)
+
+                        # 3. Fallback: Try "Show Name - 01" (Anime Style) 
+                        # This matches "[Group] Show Name - 01 [Info]" -> "Show Name", "01"
+                        if not match:
+                             match = re.search(r'(.*?)[\s\.]+-[\s\.]+(\d+)(?!\d).*', title)
+                             # Note: This blindly assumes it's S01 if not specified, which is common for " - 01"
+                             if match:
+                                 # We treat "01" as Episode 1, Season 1 (default)
+                                 # We need to restructure match group logic below
+                                 pass 
+
+                        # 4. Fallback: Try "Show Name 01" (No dash, dangerous but exists)
+                        # Excluding years (1999, 20xx)
+                        # if not match: ...
+                        
+                        clean_title = title
+                        episode_info = ""
+                        season_num = status.get("season") # Prefer parsing from Core if available
+                        episode_num = status.get("episode")
+                        
+                        if match:
+                            # Cleanup name: "South.Park" -> "South Park"
+                            raw_name = match.group(1).replace(".", " ").strip()
+                            
+                            # BRACKET CLEANUP: Remove [Group] and (Year) from the captured name
+                            # E.g. "[Group] Chainsaw Man" -> "Chainsaw Man"
+                            raw_name = re.sub(r'\[.*?\]', '', raw_name)
+                            raw_name = re.sub(r'\(.*?\)', '', raw_name)
+                            raw_name = raw_name.strip()
+
+                            # If core didn't get it, use this
+                            # Check number of groups to decide strategy
+                            if len(match.groups()) >= 3:
+                                # Strategy 1 & 2: (Name, S, E)
+                                if not season_num: season_num = int(match.group(2))
+                                if not episode_num: episode_num = int(match.group(3))
+                            elif len(match.groups()) == 2:
+                                 # Strategy 3: (Name, E) -> Assume S01
+                                 if not season_num: season_num = 1
+                                 if not episode_num: episode_num = int(match.group(2))
+                            
+                            clean_title = raw_name
+                            episode_info = f"S{season_num:02d}E{episode_num:02d}"
+                            
+                            # Use clean title for both Display and Search initially
+                            search_query = clean_title 
+                        else:
+                            # Fallback: Just clean up common junk
+                            # Remove brackets [] and parenthesis () content completely
+                            clean_title = re.sub(r'\[.*?\]', '', title)
+                            clean_title = re.sub(r'\(.*?\)', '', clean_title)
+                            # Remove file extensions if present
+                            clean_title = re.sub(r'\.(mkv|mp4|avi)$', '', clean_title, flags=re.IGNORECASE)
+                            clean_title = clean_title.replace(".", " ").strip()
+                            search_query = clean_title
+                            
+                        # Timestamps
+                        start_ts = None
+                        end_ts = None
+                        if state == "playing" and position > 0:
+                            start_ts = int(time.time() - (position / 1000))
+                            if duration > 0:
+                                end_ts = int(start_ts + (duration / 1000)) # INT cast is CRITICAL
+                        
+                        # FORCE TIMER STOP ON PAUSE (User Request)
+                        if state == "paused":
+                            start_ts = None
+                            end_ts = None
+
+                        imdb_id = None 
+                        current_tmdb_id = None # Track ID for skipping
+
+                        if clean_title != getattr(self, "last_clean_title", None):
+                             # Reset Trakt scrobble state for new item
+                             self.last_trakt_playing = False
+                             self.last_trakt_progress = 0
+                             self.trakt_scrobbled = False
+
+                        # SMART SEARCH LOGIC
+                        if title != getattr(self, "last_raw_user_title", None):
+                            
+                            # CLEAR CACHES
+                            self.cached_ep_details = None
+                            
+                            q_raw = clean_title
+                            q_stripped = re.sub(r'\s*\(?\d{4}\)?.*$', '', clean_title).strip()
+                            
+                            if q_raw == "MS NOW": q_raw = "MSNBC"; q_stripped = "MSNBC"
+                            if search_query and search_query != title: q_raw = search_query; q_stripped = re.sub(r'\s*\(?\d{4}\)?.*$', '', search_query).strip()
+
+                            print(f"DEBUG: Searching TMDB for Raw: '{q_raw}'")
+                            meta = self.tmdb.search_content(q_raw)
+                            
+                            if not meta and q_stripped != q_raw and len(q_stripped) > 2:
+                                print(f"DEBUG: Raw search failed. Trying Stripped: '{q_stripped}'")
+                                meta = self.tmdb.search_content(q_stripped)
+                                if meta:
+                                    clean_title = q_stripped
+
+                            image_url = None
+                            
+                            if meta:
+                                # ... (TMDB Success Block - Unchanged) ...
+                                print(f"DEBUG: Found Show: {meta.get('title')}")
+                                
+                                if meta.get("title"):
+                                    clean_title = meta.get("title")
+                                
+                                image_url = meta.get("image_url")
+                                imdb_id = meta.get("imdb_id")
+                                
+                                # Store TMDB ID for Auto Skip
+                                current_tmdb_id = meta.get("id")
+                                self.current_tmdb_id_cache = current_tmdb_id
+                                    
+                                if season_num and episode_num:
+                                    try:
+                                        ep_data = self.tmdb.get_episode_details(meta['id'], season_num, episode_num)
+                                        if ep_data and ep_data.get("name"):
+                                            ep_name = ep_data.get("name")
+                                            episode_info = f"S{season_num:02d}E{episode_num:02d} - {ep_name}"
+                                            self.cached_ep_details = (season_num, episode_num, episode_info)
+                                            print(f"DEBUG: Found Episode Name: {ep_name}")
+                                    except Exception as e:
+                                        print(f"DEBUG: Failed to fetch episode info: {e}")
+                                
+                                img = self.tmdb.download_image(image_url)
+                                self.after(0, self.update_poster, img)
+                                self.last_image_url = image_url
+                                self.current_imdb = imdb_id
+                                
+                                tmdb_id = meta.get("id")
+                                media_type = meta.get("type", "tv")
+                                if media_type == "tv":
+                                    if season_num and episode_num:
+                                         self.current_tmdb_url = f"https://www.themoviedb.org/tv/{tmdb_id}/season/{season_num}/episode/{episode_num}"
+                                    else:
+                                         self.current_tmdb_url = f"https://www.themoviedb.org/tv/{tmdb_id}"
+                                else:
+                                    self.current_tmdb_url = f"https://www.themoviedb.org/movie/{tmdb_id}"
+
+                            else:
+                                print("DEBUG: TMDB Meta NOT Found. Trying MAL Fallback...")
+                                
+                                # MAL FALLBACK LOGIC
+                                mal_meta_found = False
+                                if self.config.get("aniskip_enabled") and self.mal_client_id:
+                                    try:
+                                        # 1. Resolve MAL ID
+                                        mal_id = self.mal_id_cache.get(clean_title)
+                                        if not mal_id:
+                                             mal_id = self.mal_mapper.search_anime(clean_title)
+                                             if mal_id: self.mal_id_cache[clean_title] = mal_id
+                                        
+                                        # 2. Fetch Details
+                                        if mal_id:
+                                            mal_details = self.mal_mapper.get_anime_details(mal_id)
+                                            if mal_details:
+                                                 print(f"DEBUG: Found MAL Meta: {mal_details}")
+                                                 clean_title = mal_details.get("title")
+                                                 image_url = mal_details.get("image_url")
+                                                 self.after(0, self.update_poster, self.tmdb.download_image(image_url)) # Reuse download_image for generic URL
+                                                 self.last_image_url = image_url
+                                                 
+                                                 # Dummy IDs for logic flow
+                                                 imdb_id = f"mal_{mal_id}" 
+                                                 self.current_imdb = imdb_id
+                                                 mal_meta_found = True
+                                                 self.current_tmdb_url = f"https://myanimelist.net/anime/{mal_id}"
+                                    except Exception as e:
+                                        print(f"DEBUG: MAL Fallback Error: {e}")
+
+                                if not mal_meta_found:
+                                    print("DEBUG: ALL Meta Checks Failed.")
+                                    self.after(0, self.update_poster, None)
+                                    self.last_image_url = None
+                                    self.current_imdb = None
+                                    imdb_id = None
+                                    self.current_tmdb_url = "https://www.themoviedb.org/"
+                                self.current_tmdb_id_cache = None
+                            
+                            self.last_clean_title = clean_title
+                        else:
+                            # Restore cached values for consistent display
+                            if getattr(self, "last_clean_title", None):
+                                clean_title = self.last_clean_title
+                                
+                            image_url = getattr(self, "last_image_url", None)
+                            imdb_id = getattr(self, "current_imdb", None)
+                            current_tmdb_id = getattr(self, "current_tmdb_id_cache", None)
+
+                        # AUTO SKIP LOGIC
+                        now = time.time()
+                        skip_times = None
+                        skip_status_msg = ""
+                        skip_status_color = "gray"
+
+                        if imdb_id and season_num and episode_num:
+                             # 1. Fetch skip times if needed (Dual Skip Logic)
+                             # A. Try IntroDB
+                             skip_times = self.skip_manager.get_skip_times(imdb_id, season_num, episode_num)
+                             
+                             # B. Fallback to Aniskip if enabled and IntroDB failed
+                             if not skip_times and self.config.get("aniskip_enabled"):
+                                 try:
+                                     # Check Cache for MAL ID
+                                     mal_id = self.mal_id_cache.get(clean_title)
+                                     
+                                     # If not cached, resolve it
+                                     if not mal_id:
+                                          print(f"DEBUG: IntroDB failed. Attempting to resolve MAL ID for '{clean_title}'...")
+                                          mal_id = self.mal_mapper.search_anime(clean_title)
+                                          if mal_id:
+                                              self.mal_id_cache[clean_title] = mal_id
+                                              print(f"DEBUG: Resolved MAL ID: {mal_id}")
+                                          else:
+                                              print("DEBUG: Could not resolve MAL ID.")
+                                     
+                                     # Query Aniskip
+                                     if mal_id:
+                                          print(f"DEBUG: Checking Aniskip for MAL {mal_id} Ep {episode_num}...")
+                                          # Aniskip returns list of dicts: [{'start':..., 'end':..., 'type':...}]
+                                          ani_skips = self.aniskip.get_skip_times(mal_id, episode_num)
+                                          if ani_skips:
+                                              print(f"DEBUG: Aniskip Found: {ani_skips}")
+                                              skip_times = ani_skips
+                                 except Exception as e:
+                                     print(f"DEBUG: Aniskip Error: {e}")
+                             
+                             if skip_times:
+                                 # Determine types found
+                                 types_found = set()
+                                 for s in skip_times:
+                                     types_found.add(s.get("type", "intro").title())
+                                 
+                                 skip_status_msg = f"{' & '.join(sorted(types_found))} Skip Found"
+                                 skip_status_color = "#2CC985"
+                             else:
+                                 skip_status_msg = "No Skip Found\nContribute @ introdb.app"
+                                 skip_status_color = "#E67E22"
+                             
+                             # 2. Check position
+                             # COOLDOWN: Don't skip if we just skipped in the last 5 seconds
+                             # 2. Check position
+                             # COOLDOWN: Don't skip if we just skipped in the last 5 seconds
+                             if now - getattr(self, "last_skip_time", 0) > 5:
+                                 skip_res = self.skip_manager.should_skip(position, skip_times)
+                                 
+                                 if skip_res:
+                                     target_ms, skip_type = skip_res
+                                     skip_mode = self.config.get("skip_mode", "auto")
+                                     
+                                     if skip_mode == "auto":
+                                         # AUTO MODE: Execute Immediately
+                                         print(f"DEBUG: Auto-Skipping {skip_type} to {target_ms}ms (Source: {imdb_id}) Current: {position}")
+                                         self.controller.seek_to(target_ms, current_ms=position)
+                                         self.last_skip_time = now
+                                         
+                                     elif skip_mode == "button":
+                                         # BUTTON MODE: Show Button
+                                         def do_skip(t=target_ms):
+                                              self.controller.seek_to(t, current_ms=position)
+                                              self.last_skip_time = time.time()
+                                              # Hide button logic happens next loop
+                                         
+                                         # We use after to safely update UI from thread
+                                         self.after(0, lambda: self.btn_skip_action.configure(text=f"SKIP {skip_type.upper()}", command=do_skip))
+                                         self.after(0, lambda: self.btn_skip_action.pack(side="left", padx=10))
+                                 else:
+                                      # Not in skip interval? Hide button
+                                      self.after(0, self.btn_skip_action.pack_forget)
+                             
+                             # Update Shared State for Web UI
+                             self.shared_state["skip_status_msg"] = skip_status_msg
+                             self.shared_state["skip_status_color"] = skip_status_color
+
+                        # Build Buttons
+                        buttons = []
+                        tmdb_url = getattr(self, "current_tmdb_url", "https://www.themoviedb.org/")
+                        
+                        stremio_deep_link = None
+                        if imdb_id:
+                             # Construct Deep Link
+                             # Format: stremio:///detail/{type}/{id}
+                             # Or: stremio:///detail/{type}/{id}/{video_id}
+                             type_str = "series" if season_num and episode_num else "movie"
+                             
+                             if type_str == "movie":
+                                  stremio_deep_link = f"stremio:///detail/movie/{imdb_id}/{imdb_id}"
+                             else:
+                                  stremio_deep_link = f"stremio:///detail/series/{imdb_id}/{imdb_id}:{season_num}:{episode_num}"
+                        
+                        buttons.append({"label": "View on TMDB", "url": tmdb_url})
+                        
+                        # Add Deep Link Button
+                        if stremio_deep_link:
+                             buttons.append({"label": "Watch on Stremio", "url": stremio_deep_link})
+                        else:
+                             buttons.append({"label": "Get Stremio Ascend", "url": "https://github.com/Cxsmo-ai/Stremio-Ascend"})
+
+                        if season_num and episode_num and getattr(self, "cached_ep_details", None):
+                             cs, ce, cinfo = self.cached_ep_details
+                             if cs == season_num and ce == episode_num:
+                                 episode_info = cinfo
+    
+                        # RPC Update
+                        safe_title = self.apply_filter(clean_title)
+                        safe_episode = self.apply_filter(episode_info)
+
+                        line1 = safe_title
+                        verb = "Watching" if state == "playing" else "Paused"
+
+                        def format_time(ms):
+                            if ms <= 0: return "0:00"
+                            seconds = int(ms / 1000)
+                            m, s = divmod(seconds, 60)
+                            h, m = divmod(m, 60)
+                            if h > 0: return f"{h}:{m:02d}:{s:02d}"
+                            return f"{m}:{s:02d}"
+
+                        device_part = f" on {self.device_name}" if self.var_show_device.get() else ""
+                        
+                        if safe_episode:
+                            line2 = safe_episode
+                        else:
+                            line2 = f"{verb}{device_part}"
+                        
+                        small_text_val = f"{verb}{device_part}"
+
+                        current_payload = {
+                            "details": line1,
+                            "state": line2,
+                            "image_url": image_url,
+                            "small_image": "play" if state == "playing" else "pause",
+                            "small_text": small_text_val,
+                            "end_timestamp": end_ts, 
+                        }
+                        
+                        should_update = False
+                        force_update = False
+                        
+                        if self.last_rpc_payload:
+                            old_state = self.last_rpc_payload.get("small_image")
+                            new_state = "play" if state == "playing" else "pause"
+                            
+                            if old_state != new_state: force_update = True
+                            if line1 != self.last_rpc_payload.get("details"): force_update = True
+                                
+                            last_ts = self.last_rpc_payload.get("start_ts_val")
+                            if start_ts and (not last_ts or abs(start_ts - last_ts) > 5): force_update = True
+
+                        now = time.time()
+                        time_since_last = now - getattr(self, "last_update_success_time", 0)
+                        
+                        if current_payload != self.last_rpc_payload:
+                             if force_update or time_since_last >= 15:
+                                 should_update = True
+
+                        if should_update:
+                            try:
+                                if state == "paused":
+                                    # User Request: Don't show RPC at all when paused
+                                    self.rpc.clear()
+                                else:
+                                    self.rpc.update(
+                                        details=line1,
+                                        state=line2,
+                                        image_url=image_url,
+                                        small_image="play",
+                                        small_text=small_text_val,
+                                        start_timestamp=start_ts,
+                                        end_timestamp=end_ts,
+                                        buttons=buttons[:2],
+                                        activity_type=3,
+                                        party_id=imdb_id if imdb_id else None,
+                                        join_secret=stremio_deep_link if stremio_deep_link else None
+                                    )
+                                
+                                self.last_rpc_payload = current_payload
+                                self.last_rpc_payload["start_ts_val"] = start_ts
+                                self.last_update_success_time = time.time()
+                                self.rpc_fail_count = 0 # Reset fail count on success
+                            except Exception as e:
+                                print(f"DEBUG: RPC Update FAILED: {e}")
+                                self.rpc_fail_count = getattr(self, "rpc_fail_count", 0) + 1
+                                
+                                # If we fail twice in a row, assume connection is dead and force reset
+                                if self.rpc_fail_count >= 2:
+                                    print("DEBUG: Force Reconnecting RPC due to repeated failures...")
+                                    try: self.rpc.close()
+                                    except: pass
+                                    self.rpc.connected = False # Trigger reconnect in next loop
+
+                        last_title = clean_title + episode_info
+
+                        final_display_title = self.apply_filter(clean_title)
+                        safe_ep_info = self.apply_filter(episode_info)
+                        base_subtitle = safe_ep_info if safe_ep_info else (state.title() if state else "Idle")
+                        
+                        if duration and duration > 0:
+                             base_subtitle += f" • {format_time(duration)}"
+                        
+                        final_display_subtitle = base_subtitle
+
+                        self.after(0, lambda t=final_display_title, s=final_display_subtitle, st=state, d=duration, p=position: (
+                            self.lbl_title.configure(text=t),
+                            self.lbl_state.configure(text=s, text_color="#2CC985" if st=="playing" else "#AAAAAA"),
+                            self.progress_bar.set(p / d if d > 0 else 0),
+                            self.lbl_skip_msg.configure(text=skip_status_msg, text_color=skip_status_color)
+                        ))
+                        
+                        # Update Safe State for Web Server
+                        self.shared_state.update({
+                            "title": final_display_title,
+                            "subtitle": final_display_subtitle,
+                            "progress": position / duration if duration > 0 else 0,
+                            "image_url": self.last_image_url,
+                            "connected": True,
+                            "device": self.device_name,
+                            "is_playing": state == "playing",
+                            "auto_skip": self.skip_manager.enabled,
+                            "position_val": position,
+                            "duration_val": duration,
+                            # Meta for Submission
+                            "meta_imdb": imdb_id,
+                            "meta_season": season_num,
+                            "meta_episode": episode_num,
+                            "skip_status_msg": skip_status_msg,
+                            "skip_status_color": skip_status_color
+                        })
+                        
+                        # --- TRAKT SCROBBLE LOGIC ---
+                        if self.trakt.access_token and imdb_id:
+                            trakt_progress = (position / duration * 100) if duration > 0 else 0
+                            
+                            # Determine Action
+                            trakt_action = None
+                            
+                            # Only scrobble if changed significantly or state change
+                            is_playing = (state == "playing")
+                            was_playing = getattr(self, "last_trakt_playing", False)
+                            
+                            if is_playing and not was_playing:
+                                trakt_action = "start"
+                            elif not is_playing and was_playing:
+                                trakt_action = "pause"
+                            elif is_playing and abs(trakt_progress - getattr(self, "last_trakt_progress", 0)) > 5:
+                                # Update every 5%
+                                trakt_action = "start" # 'start' works as update in Trakt API
+                            elif trakt_progress > 90 and not getattr(self, "trakt_scrobbled", False):
+                                trakt_action = "stop" # Mark as database watched
+                                self.trakt_scrobbled = True
+                                
+                            if trakt_action:
+                                if trakt_action == "stop" and self.trakt_scrobbled and self.last_trakt_progress > 90:
+                                     pass # Prevent double stop if already marked as scrobbled
+                                else:
+                                    print(f"DEBUG: Trakt Scrobble {trakt_action} {trakt_progress}%")
+                                    # Need media object
+                                    media_obj = {}
+                                    if season_num and episode_num:
+                                         # For episodes, Trakt expects the show's IMDB ID and episode numbers
+                                         media_obj["episode"] = {
+                                             "ids": {"imdb": imdb_id}, # This is the show's IMDB ID
+                                             "season": season_num,
+                                             "number": episode_num
+                                         }
+                                    else:
+                                         media_obj["movie"] = {"ids": {"imdb": imdb_id}}
+                                    
+                                    if media_obj:
+                                         threading.Thread(target=self.trakt.scrobble, args=(trakt_action, media_obj, trakt_progress), daemon=True).start()
+                                
+                            self.last_trakt_playing = is_playing
+                            self.last_trakt_progress = trakt_progress
+                        
+                    elif state == "stopped":
+                         if last_title:
+                             self.rpc.clear()
+                             self.after(0, self.update_poster, None)
+                             last_title = None
+    
+                time.sleep(self.config["update_interval"])
+        except Exception as e:
+            print(f"Monitor Loop Critical Error: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def restart_app(self):
+        print("FORCING RESTART...")
+        try:
+            import subprocess
+            # Nuitka/PyInstaller logic: sys.executable is the EXE
+            # We don't need sys.argv in a simple restart unless passing flags
+            # Using sys.executable directly is the safest for OneFile
+            args = [sys.executable]
+            
+            # If we need to preserve arguments (unlikely for Lite version but good practice)
+            # args.extend(sys.argv[1:]) 
+            
+            subprocess.Popen(args)
+            
+            # Close the current app
+            self.quit()
+            self.destroy()
+            sys.exit(0)
+        except Exception as e:
+            print(f"Restart failed: {e}")
+            messagebox.showerror("Error", f"Could not restart: {e}")
+
+def run_app():
+    try:
+        from src.core.logger import setup_logging
+        setup_logging()
+        app = App()
+        app.mainloop()
+    except Exception as e:
+        import logging
+        logging.critical(f'CRITICAL CRASH: {e}', exc_info=True)
+        try:
+            import tkinter.messagebox
+            tkinter.messagebox.showerror('Critical Error', f'Failed to start: {e}')
+        except: pass
+
+if __name__ == '__main__':
+    run_app()

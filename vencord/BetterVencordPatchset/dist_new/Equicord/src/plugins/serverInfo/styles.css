@@ -1,0 +1,169 @@
+.vc-gp-root {
+    height: 100%;
+    user-select: text;
+}
+
+.vc-gp-banner {
+    cursor: pointer;
+    aspect-ratio: auto 240 / 135;
+    height: 334px;
+    width: 100%;
+    object-fit: cover;
+    overflow: clip;
+    overflow-clip-margin: content-box;
+}
+
+.vc-gp-header {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 0.5em;
+    margin: 0.5em;
+}
+
+.vc-gp-icon {
+    width: 48px;
+    height: 48px;
+    cursor: pointer;
+}
+
+.vc-gp-name-and-description {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2em;
+}
+
+.vc-gp-name {
+    margin: 0;
+}
+
+.vc-gp-tab-bar {
+    border-bottom: 1px solid var(--border-subtle);
+    margin: 20px 12px 0;
+    display: flex;
+    align-items: stretch;
+    flex-direction: row;
+    justify-content: center;
+}
+
+.vc-gp-tab {
+    border-bottom: 2px solid transparent;
+    color: var(--interactive-icon-default);
+    cursor: pointer;
+    line-height: 14px;
+}
+
+.vc-gp-tab-content {
+    margin: 1em;
+}
+
+.vc-gp-tab:where(.vc-gp-selected, :hover, :focus) {
+    border-bottom-color: var(--interactive-icon-active);
+}
+
+.vc-gp-info {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 1em;
+}
+
+.vc-gp-server-info-pair {
+    color: var(--text-default);
+}
+
+.vc-gp-server-info-pair [class*="timestamp"] {
+    margin-left: 0;
+}
+
+.vc-gp-owner {
+    display: flex;
+    align-items: center;
+    gap: 0.2em;
+}
+
+.vc-gp-owner-avatar {
+    height: 20px;
+    border-radius: 50%;
+    cursor: pointer;
+}
+
+.vc-gp-scroller {
+    width: 100%;
+    max-height: 500px;
+}
+
+.vc-gp-member-row {
+    display: flex;
+    align-items: center;
+    padding-right: 16px;
+    cursor: pointer;
+    position: relative;
+    margin: 1px 0;
+    width: 100%;
+}
+
+.vc-gp-member-row:hover {
+    background-color: var(--background-mod-subtle);
+}
+
+.vc-gp-member-content {
+    flex: 1;
+    min-width: 0;
+    width: 100%;
+    position: relative;
+}
+
+.vc-gp-member-icons {
+    user-select: none;
+    position: absolute;
+    right: 20px;
+    z-index: 2;
+}
+
+.vc-gp-mutual-guilds {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+    padding-left: 8px;
+}
+
+.vc-gp-guild-icon {
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: var(--background-base-low);
+    overflow: hidden;
+}
+
+.vc-gp-guild-icon img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+.vc-gp-guild-acronym {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 8px;
+    font-weight: 600;
+    color: var(--text-default);
+    text-transform: uppercase;
+}
+
+.vc-gp-guild-count {
+    font-size: 12px;
+    color: var(--text-muted);
+    font-weight: 600;
+}
+
+.vc-gp-scroller [class*="listRow"] {
+    margin: 1px 0;
+}
+
+.vc-gp-scroller [class*="listRow"]:hover {
+    background-color: var(--background-mod-subtle);
+}
